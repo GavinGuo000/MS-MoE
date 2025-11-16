@@ -48,6 +48,7 @@ Aggregates expert outputs via **attention weighting**, dynamically adjusting the
 Install dependencies:
 ```bash
 pip install torch numpy pandas scikit-learn matplotlib tqdm
+```
 
 ## Quick Start
 
