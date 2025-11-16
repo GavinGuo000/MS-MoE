@@ -50,12 +50,15 @@ Install dependencies:
 pip install torch numpy pandas scikit-learn matplotlib tqdm
 ```
 
+
 ## Quick Start
 
 ### Data Preparation
 Download benchmark datasets (ETT, Weather, Solar, Electricity, Traffic) or preprocess using:
 ```bash
 python data_preprocess.py --data_dir ./data --dataset ETTh1
+```
+
 
 ## Experimental Configuration
 
