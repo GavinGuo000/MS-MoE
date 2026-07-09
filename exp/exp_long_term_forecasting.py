@@ -31,7 +31,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        # Use AdamW optimizer
+        model_optim = optim.AdamW(self.model.parameters(), lr=self.args.learning_rate,
+                                  weight_decay=getattr(self.args, 'weight_decay', 1e-4))
         return model_optim
 
     def _select_criterion(self):
@@ -65,15 +67,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
+                        result = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                         if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            outputs = result[0][0] if isinstance(result[0], tuple) else result[0]
                         else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                            outputs = result[0]
                 else:
+                    result = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                     if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        outputs = result[0][0] if isinstance(result[0], tuple) else result[0]
                     else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = result[0]
                 f_dim = -1 if self.args.features == 'MS' else 0
 
                 pred = outputs.detach()
@@ -113,11 +117,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
 
-        scheduler = lr_scheduler.OneCycleLR(optimizer=model_optim,
-                                            steps_per_epoch=train_steps,
-                                            pct_start=self.args.pct_start,
-                                            epochs=self.args.train_epochs,
-                                            max_lr=self.args.learning_rate)
+        # Use CosineAnnealingLR scheduler
+        scheduler = lr_scheduler.CosineAnnealingLR(
+            optimizer=model_optim,
+            T_max=self.args.train_epochs,
+            eta_min=getattr(self.args, 'min_lr', 1e-6)
+        )
 
         if self.args.use_amp:
             scaler = torch.cuda.amp.GradScaler()
@@ -152,25 +157,39 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
+                        result = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                         if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            outputs = result[0][0] if isinstance(result[0], tuple) else result[0]
                         else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                            outputs, router_logits, branch_outputs = result
 
                         f_dim = -1 if self.args.features == 'MS' else 0
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                        loss = criterion(outputs, batch_y)
+                        batch_y_target = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                        loss = criterion(outputs, batch_y_target)
+
+                        # Auxiliary losses
+                        aux_loss = self.model.compute_moe_aux_loss(router_logits)
+                        branch_loss = self.model.compute_branch_aux_loss(branch_outputs, batch_y, criterion)
+                        loss = loss + aux_loss + branch_loss
                         train_loss.append(loss.item())
                 else:
+                    result = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                     if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        outputs = result[0][0] if isinstance(result[0], tuple) else result[0]
                     else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs, router_logits, branch_outputs = result
 
                     f_dim = -1 if self.args.features == 'MS' else 0
+                    outputs_pred = outputs[:, -self.args.pred_len:, f_dim:]
+                    batch_y_target = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
 
-                    loss = criterion(outputs, batch_y)
+                    loss = criterion(outputs_pred, batch_y_target)
+
+                    # MoE load-balancing aux loss + tri-scale branch aux loss
+                    aux_loss = self.model.compute_moe_aux_loss(router_logits)
+                    branch_loss = self.model.compute_branch_aux_loss(branch_outputs, batch_y, criterion)
+                    loss = loss + aux_loss + branch_loss
                     train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
@@ -183,10 +202,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 if self.args.use_amp:
                     scaler.scale(loss).backward()
+                    # Gradient clipping
+                    scaler.unscale_(model_optim)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                                   max_norm=getattr(self.args, 'grad_clip', 1.0))
                     scaler.step(model_optim)
                     scaler.update()
                 else:
                     loss.backward()
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                                   max_norm=getattr(self.args, 'grad_clip', 1.0))
                     model_optim.step()
 
                 if self.args.lradj == 'TST':
@@ -206,6 +232,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 break
 
             if self.args.lradj != 'TST':
+                # CosineAnnealingLR step per epoch
+                scheduler.step()
                 adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=True)
             else:
                 print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
@@ -250,16 +278,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
+                        result = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                         if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            outputs = result[0][0] if isinstance(result[0], tuple) else result[0]
                         else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                            outputs = result[0]
                 else:
+                    result = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                     if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-
+                        outputs = result[0][0] if isinstance(result[0], tuple) else result[0]
                     else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = result[0]
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 
@@ -295,12 +324,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print('mse:{}, mae:{}'.format(mse, mae))
 
-        # 从root_path中提取数据集名称
+        # Extract dataset name from root_path
         dataset_name = self.args.root_path.rstrip('/').split('/')[-1]
-        if not dataset_name:  # 如果root_path以/结尾，取倒数第二个部分
+        if not dataset_name:  # fallback if root_path ends with /
             dataset_name = self.args.root_path.rstrip('/').split('/')[-2]
         
-        # 添加结果保存到文件，使用从root_path提取的数据集名称
+        # Save results to file using dataset name from root_path
         result_filename = f"result_long_term_forecast_{dataset_name}_seq{self.args.seq_len}_pred{self.args.pred_len}.txt"
         with open(result_filename, 'a') as f:
             f.write(f"Dataset: {dataset_name}, Seq_len: {self.args.seq_len}, Pred_len: {self.args.pred_len}\n")
@@ -309,11 +338,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             f.write(f"Model: {self.args.model}, D_model: {self.args.d_model}, Learning_rate: {self.args.learning_rate}\n")
             f.write("-" * 80 + "\n")
         
-        # 保存详细指标到numpy文件
+        # Save detailed metrics to numpy file
         metrics_filename = folder_path + f'metrics_{dataset_name}_seq{self.args.seq_len}_pred{self.args.pred_len}.npy'
         np.save(metrics_filename, np.array([mae, mse, rmse, mape, mspe]))
         
-        # 保存预测结果
+        # Save prediction results
         np.save(folder_path + f'pred_{dataset_name}_seq{self.args.seq_len}_pred{self.args.pred_len}.npy', preds)
         np.save(folder_path + f'true_{dataset_name}_seq{self.args.seq_len}_pred{self.args.pred_len}.npy', trues)
         

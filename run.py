@@ -96,6 +96,16 @@ parser.add_argument('--pct_start', type=float, default=0.2, help='pct_start')
 parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 parser.add_argument('--comment', type=str, default='none', help='com')
 
+# MoE params
+parser.add_argument('--num_experts', type=int, default=8, help='number of experts per scale')
+parser.add_argument('--num_experts_per_tok', type=int, default=2, help='number of experts selected per token (top_k)')
+parser.add_argument('--aux_loss_weight', type=float, default=0.01, help='weight for MoE load-balancing auxiliary loss')
+parser.add_argument('--branch_loss_weight', type=float, default=0.1, help='weight for scale-branch auxiliary loss')
+parser.add_argument('--apply_aux_loss', type=bool, default=True, help='whether to apply MoE auxiliary loss')
+parser.add_argument('--grad_clip', type=float, default=1.0, help='gradient clipping max norm')
+parser.add_argument('--weight_decay', type=float, default=1e-4, help='AdamW weight decay')
+parser.add_argument('--min_lr', type=float, default=1e-6, help='CosineAnnealingLR minimum learning rate')
+
 # GPU
 parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
 parser.add_argument('--gpu', type=int, default=0, help='gpu')
